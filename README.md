@@ -8,7 +8,7 @@ Mag-VLA predicts coordinated planar movements of two magnet-mounted arms from mi
 
 | Paper reference | Implementation and scope |
 | --- | --- |
-| Figure 2 and Section III-B | `MagVLAPolicy._run_vlm` encodes four images and the instruction. `_inject_state` appends a token for the two arms’ planar positions in the order left x, left y, right x, right y. |
+| Figure 2 and Section III-B | `MagVLAPolicy._run_vlm` encodes four images and the instruction. `_inject_state` prepends a token for the two arms’ planar positions in the order left x, left y, right x, right y. |
 | Section III-C.1 and Eq. (1) | `PhaseHead` combines pooled features with current arm positions and the displacement between the oldest and newest states. `ACTChunkHead` uses a learned phase embedding and five action queries to predict five successive four-axis increments. The code uses labelled phases during training and predicted phases in evaluation mode. |
 | Section III-C.2 and Eq. (2) | The paper combines overlapping predicted chunks during deployment. The [offline reference implementation](MARSS/codebase/temporal_ensemble.py) accepts one predicted chunk per replan. It implements the equation independently of the hardware controller. |
 | Section III-D and Eq. (4) | The ACT training objective combines smooth L1 action loss (beta 1) with phase cross-entropy. The released configuration sets the phase weight to 0.5. |

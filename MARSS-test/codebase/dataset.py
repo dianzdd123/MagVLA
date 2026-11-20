@@ -1,13 +1,5 @@
-"""
-MagVLA Dataset
-
-读取 lerobot_datasetV2，按 split (train/val/test) 构造训练样本。
-每帧构造:
-  - 4 帧历史图像 (observation.images.main)
-  - 1 个当前 state (observation.state)
-  - 1 个语言指令 (task_text)
-  - 1 个 phase_gt
-  - 未来 5 步的 action_delta chunk (ACT target)
+"""Construct episode-aligned training samples for ACT with an additional DistilBERT
+instruction token from video, per-frame Parquet records and task metadata.
 """
 
 import json
@@ -23,7 +15,9 @@ __all__ = ["MagVLADataset"]
 
 
 def _read_video_frames(video_path: str, indices: list) -> list:
-    """从 mp4 读取指定帧索引列表，返回 BGR 图像列表 (H, W, 3)"""
+    """Seek to each requested video frame in order. Return BGR arrays, with None for
+    individual decode failures. An unreadable video raises IOError.
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise IOError(f"Cannot open video: {video_path}")
@@ -39,14 +33,9 @@ def _read_video_frames(video_path: str, indices: list) -> list:
 
 
 class MagVLADataset(Dataset):
-    """
-    参数:
-        data_dir: lerobot_datasetV2 根目录
-        split: "train" / "val" / "test"
-        image_history: 历史图像帧数，默认 4
-        chunk_size: ACT 预测的未来步数，默认 5
-        normalize: 是否对 state/action_delta 做归一化，默认 True
-        image_downscale: 图像下采样分辨率 (H, W)，默认 None（使用原分辨率）
+    """Index valid (episode, frame) pairs for one split. image_history controls how many
+    observations end at the selected frame. chunk_size controls how many actions begin
+    there. Optional normalisation reads statistics from meta/info.json.
     """
 
     def __init__(
@@ -66,7 +55,7 @@ class MagVLADataset(Dataset):
         self.image_downscale = image_downscale  # (H, W)
         self.augment = (split == "train")
 
-        # ── 读取 meta ──────────────────────────────────────────────────────
+        # Load split membership, task descriptions and dataset statistics.
         with open(self.data_dir / "meta" / "splits.json", encoding="utf-8") as f:
             splits = json.load(f)
         self.episode_indices = splits[split]
@@ -80,11 +69,11 @@ class MagVLADataset(Dataset):
         with open(self.data_dir / "meta" / "info.json", encoding="utf-8") as f:
             self.info = json.load(f)
 
-        # 归一化参数（仅 train split）
+        # Read the normalisation statistics supplied in dataset metadata.
         self.norm = self.info.get("normalization", None)
 
-        # ── 建立 (episode_index, frame_index) 索引 ─────────────────────────
-        # 过滤掉 episode 末尾不足 chunk_size 的帧（避免未来 chunk 全是重复的最后一个 action）
+        # Index valid samples by episode and starting frame.
+        # Exclude episode tails that cannot supply a complete target chunk.
         self.samples = []
         self.episode_data = {}  # ep_idx -> parquet DataFrame
 
@@ -96,11 +85,11 @@ class MagVLADataset(Dataset):
             self.episode_data[ep_idx] = df
             N = len(df)
             for frame_idx in range(N - self.chunk_size + 1):
-                # 跳过 return 阶段（phase==2）的帧
+                # Exclude frames labelled return (phase 2).
                 phase = int(df["phase"].iloc[frame_idx])
                 if phase == 2:
                     continue
-                # 跳过 chunk 跨越到 return 阶段的帧（避免 action target 包含回家动作）
+                # Exclude windows that enter the return phase during the target chunk.
                 chunk_phases = df["phase"].iloc[frame_idx : frame_idx + self.chunk_size].values
                 if any(int(p) == 2 for p in chunk_phases):
                     continue
@@ -108,24 +97,29 @@ class MagVLADataset(Dataset):
 
     # ─────────────────────────────────────────────────────────────────────
     def __len__(self) -> int:
+        """Count eligible starting frames after phase and horizon filtering."""
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict:
+        """Return one aligned observation history, task instruction, current arm state,
+        phase label and future action chunk. History indices clamp to frame zero at
+        the start of an episode.
+        """
         ep_idx, frame_idx = self.samples[idx]
         df = self.episode_data[ep_idx]
         N = len(df)
 
-        # ── 当前状态 ────────────────────────────────────────────────────
+        # Current planar arm positions.
         state = np.array(df["observation.state"].iloc[frame_idx], dtype=np.float32)  # [4]
 
-        # ── 当前 phase ─────────────────────────────────────────────────
+        # Ground-truth manipulation phase for this frame.
         phase_gt = int(df["phase"].iloc[frame_idx])  # 0 / 1 / 2
 
-        # ── task_text（纯任务描述，不泄漏 phase 信息）────────────────────
+        # Look up the task instruction independently of the phase label.
         task_index = int(df["task_index"].iloc[frame_idx])
         task_text = self.tasks[task_index]
 
-        # ── 历史图像 ───────────────────────────────────────────────────
+        # Gather the camera frames ending at the current time step.
         video_path = str(
             self.data_dir
             / "videos"
@@ -139,13 +133,13 @@ class MagVLADataset(Dataset):
         ]
         frames = _read_video_frames(video_path, history_indices)
 
-        # ── 历史状态（与图像帧对齐）──────────────────────────────────
+        # Use the same frame indices for the arm-state history.
         state_history = np.stack([
             np.array(df["observation.state"].iloc[idx], dtype=np.float32)
             for idx in history_indices
         ])  # [4, 4]  (4 frames × 4 state dims)
 
-        # BGR -> RGB，并 resize
+        # Convert OpenCV BGR frames to RGB and resize.
         images = []
         for f in frames:
             if f is None:
@@ -161,11 +155,11 @@ class MagVLADataset(Dataset):
                     )
             images.append(img)
 
-        # ── 轻量图像增强（仅 train）───────────────────────────────
+        # Apply photometric augmentation only to training observations.
         if self.augment:
             import random
 
-            # 亮度增强：±15%
+            # Randomly scale brightness by up to 15 percent.
             if random.random() < 0.5:
                 factor = random.uniform(0.85, 1.15)
                 images_aug = []
@@ -174,7 +168,7 @@ class MagVLADataset(Dataset):
                     images_aug.append(np.clip(img_f, 0, 255).astype(np.uint8))
                 images = images_aug
 
-            # 对比度增强：±10%
+            # Randomly scale contrast by up to 10 percent.
             if random.random() < 0.3:
                 factor = random.uniform(0.90, 1.10)
                 images_aug = []
@@ -186,12 +180,12 @@ class MagVLADataset(Dataset):
 
         images = np.stack(images, axis=0)  # [4, H, W, 3] RGB
 
-        # ── 未来 chunk（frame_idx 已保证 <= N - chunk_size，无需 min 截断）───
+        # The sample index guarantees a complete future action window.
         action_delta_chunk = np.stack(
             df["action_delta"].iloc[frame_idx : frame_idx + self.chunk_size].values
         ).astype(np.float32)
 
-        # ── 归一化 ─────────────────────────────────────────────────────
+        # Apply the stored state and action normalisation statistics.
         if self.normalize and self.norm:
             dm = np.array(self.norm["action_delta_mean"], dtype=np.float32)
             ds = np.array(self.norm["action_delta_std"], dtype=np.float32)
@@ -215,5 +209,5 @@ class MagVLADataset(Dataset):
         }
 
     def get_episode_info(self, ep_idx: int) -> dict:
-        """返回指定 episode 的元信息"""
+        """Return the cached Parquet DataFrame for the requested episode index."""
         return self.episode_data[ep_idx]

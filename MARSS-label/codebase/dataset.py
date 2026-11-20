@@ -1,11 +1,5 @@
-"""
-MagVLA Dataset - 带圆圈标记版本
-
-关键修改（相对 v13）：
-- 在图像输入 VLM 之前，先在原图(1290×960)上标记两个圆圈
-- 红圆(object)：物体中心
-- 绿圆(target)：目标点
-- 标记完成后再进行下采样
+"""Construct episode-aligned training samples for ACT with object and target markers in
+the input images from video, per-frame Parquet records and task metadata.
 """
 
 import json
@@ -21,11 +15,8 @@ __all__ = ["MagVLADataset"]
 
 
 def _load_annotations_point(annotations_path: Path) -> dict:
-    """
-    加载 annotations_point.csv，构建 episode_index -> 标记数据的映射。
-
-    返回: {ep_idx: {"object_x": int, "object_y": int, "target_x": int,
-                    "target_y": int, "circle_radius": int}}
+    """Read object and target marker coordinates keyed by episode number parsed from
+    video_name. Return an empty mapping when the CSV is absent.
     """
     if not annotations_path.exists():
         print(f"  [Warning] annotations_point.csv not found: {annotations_path}")
@@ -54,19 +45,8 @@ def _draw_circles_on_frame(
     target_y: int,
     circle_radius: int,
 ) -> np.ndarray:
-    """
-    在原图上标记两个圆圈：
-    - 红圆(object)：物体中心，BGR=(255, 0, 0)
-    - 绿圆(target)：目标点，BGR=(0, 255, 0)
-
-    参数:
-        frame: BGR 图像，原始分辨率 (1290×960)
-        object_x, object_y: 红圆圆心坐标
-        target_x, target_y: 绿圆圆心坐标
-        circle_radius: 圆的半径
-
-    返回:
-        标记后的 BGR 图像
+    """Draw object and goal markers using the supplied pixel coordinates and radius. The
+    caller resizes the annotated frame afterwards.
     """
     h, w = frame.shape[:2]
 
@@ -97,7 +77,9 @@ def _draw_circles_on_frame(
 
 
 def _read_video_frames(video_path: str, indices: list) -> list:
-    """从 mp4 读取指定帧索引列表，返回 BGR 图像列表 (H, W, 3)"""
+    """Seek to each requested video frame in order. Return BGR arrays, with None for
+    individual decode failures. An unreadable video raises IOError.
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise IOError(f"Cannot open video: {video_path}")
@@ -113,14 +95,9 @@ def _read_video_frames(video_path: str, indices: list) -> list:
 
 
 class MagVLADataset(Dataset):
-    """
-    参数:
-        data_dir: lerobot_datasetV2 根目录
-        split: "train" / "val" / "test"
-        image_history: 历史图像帧数，默认 4
-        chunk_size: ACT 预测的未来步数，默认 5
-        normalize: 是否对 state/action_delta 做归一化，默认 True
-        image_downscale: 图像下采样分辨率 (H, W)，默认 None（使用原分辨率）
+    """Index valid (episode, frame) pairs for one split. image_history controls how many
+    observations end at the selected frame. chunk_size controls how many actions begin
+    there. Optional normalisation reads statistics from meta/info.json.
     """
 
     def __init__(
@@ -140,13 +117,13 @@ class MagVLADataset(Dataset):
         self.image_downscale = image_downscale
         self.augment = (split == "train")
 
-        # ── 加载圆圈标记数据 ──────────────────────────────────────────────
+        # Load the per-episode object and goal annotations.
         annotations_path = self.data_dir / "annotations_point.csv"
         self.annotations = _load_annotations_point(annotations_path)
         if self.annotations:
             print(f"  Loaded {len(self.annotations)} annotation entries from annotations_point.csv")
 
-        # ── 读取 meta ──────────────────────────────────────────────────────
+        # Load split membership, task descriptions and dataset statistics.
         with open(self.data_dir / "meta" / "splits.json", encoding="utf-8") as f:
             splits = json.load(f)
         self.episode_indices = splits[split]
@@ -160,10 +137,10 @@ class MagVLADataset(Dataset):
         with open(self.data_dir / "meta" / "info.json", encoding="utf-8") as f:
             self.info = json.load(f)
 
-        # 归一化参数（仅 train split）
+        # Read the normalisation statistics supplied in dataset metadata.
         self.norm = self.info.get("normalization", None)
 
-        # ── 建立 (episode_index, frame_index) 索引 ─────────────────────────
+        # Index valid samples by episode and starting frame.
         self.samples = []
         self.episode_data = {}
 
@@ -185,24 +162,29 @@ class MagVLADataset(Dataset):
 
     # ─────────────────────────────────────────────────────────────────────
     def __len__(self) -> int:
+        """Count eligible starting frames after phase and horizon filtering."""
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict:
+        """Return one aligned observation history, task instruction, current arm state,
+        phase label and future action chunk. History indices clamp to frame zero at
+        the start of an episode.
+        """
         ep_idx, frame_idx = self.samples[idx]
         df = self.episode_data[ep_idx]
         N = len(df)
 
-        # ── 当前状态 ────────────────────────────────────────────────────
+        # Current planar arm positions.
         state = np.array(df["observation.state"].iloc[frame_idx], dtype=np.float32)
 
-        # ── 当前 phase ─────────────────────────────────────────────────
+        # Ground-truth manipulation phase for this frame.
         phase_gt = int(df["phase"].iloc[frame_idx])
 
         # ── task_text ──────────────────────────────────────────────────
         task_index = int(df["task_index"].iloc[frame_idx])
         task_text = self.tasks[task_index]
 
-        # ── 历史图像 ───────────────────────────────────────────────────
+        # Gather the camera frames ending at the current time step.
         video_path = str(
             self.data_dir
             / "videos"
@@ -216,20 +198,20 @@ class MagVLADataset(Dataset):
         ]
         frames = _read_video_frames(video_path, history_indices)
 
-        # ── 历史状态（与图像帧对齐）──────────────────────────────────
+        # Use the same frame indices for the arm-state history.
         state_history = np.stack([
             np.array(df["observation.state"].iloc[idx], dtype=np.float32)
             for idx in history_indices
         ])
 
-        # BGR -> RGB，并在下采样之前标记圆圈
+        # Draw the spatial annotations before downsampling the RGB frames.
         images = []
         for f in frames:
             if f is None:
                 h, w = self.image_downscale or (960, 1280)
                 img = np.zeros((h, w, 3), dtype=np.uint8)
             else:
-                # ── 标记圆圈（在原图分辨率 1290×960 上标记）─────────────────
+                # Draw markers in the original frame coordinates before resizing.
                 if ep_idx in self.annotations:
                     ann = self.annotations[ep_idx]
                     f = _draw_circles_on_frame(
@@ -240,9 +222,9 @@ class MagVLADataset(Dataset):
                         target_y=ann["target_y"],
                         circle_radius=ann["circle_radius"],
                     )
-                # ── BGR 转 RGB ────────────────────────────────────────────
+                # Convert OpenCV BGR frames to RGB.
                 img = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
-                # ── 下采样 ───────────────────────────────────────────────
+                # Resize frames to the configured model input size.
                 if self.image_downscale:
                     img = cv2.resize(
                         img,
@@ -251,7 +233,7 @@ class MagVLADataset(Dataset):
                     )
             images.append(img)
 
-        # ── 轻量图像增强（仅 train）───────────────────────────────
+        # Apply photometric augmentation only to training observations.
         if self.augment:
             import random
 
@@ -274,12 +256,12 @@ class MagVLADataset(Dataset):
 
         images = np.stack(images, axis=0)
 
-        # ── 未来 chunk ─────────────────────────────────────────────────
+        # Read consecutive target actions starting at the current frame.
         action_delta_chunk = np.stack(
             df["action_delta"].iloc[frame_idx : frame_idx + self.chunk_size].values
         ).astype(np.float32)
 
-        # ── 归一化 ─────────────────────────────────────────────────────
+        # Apply the stored state and action normalisation statistics.
         if self.normalize and self.norm:
             dm = np.array(self.norm["action_delta_mean"], dtype=np.float32)
             ds = np.array(self.norm["action_delta_std"], dtype=np.float32)
@@ -303,5 +285,5 @@ class MagVLADataset(Dataset):
         }
 
     def get_episode_info(self, ep_idx: int) -> dict:
-        """返回指定 episode 的元信息"""
+        """Return the cached Parquet DataFrame for the requested episode index."""
         return self.episode_data[ep_idx]

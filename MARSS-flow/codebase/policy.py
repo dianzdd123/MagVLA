@@ -1,23 +1,5 @@
-"""
-MagVLA Policy (Version 13 - Flow Matching 版本，基于 Qwen2.5-VL-7B)
-
-关键修改（相对 version13-IX-diffusion）：
-- DiffusionChunkHead → FlowMatchingChunkHead（conditional flow matching / rectified flow）
-- 不再依赖 diffusers（flow matching 无需 noise scheduler）
-- chunk_loss 改为 velocity prediction MSE（与 diffusion 的 noise MSE 在数值上可比）
-- 推理时跑 Euler 10步积分生成动作
-
-Flow Matching 原理（π₀ 使用的技术，Lipman et al. 2023）：
-1. 训练：
-   - 采样 z ~ N(0, I) 和 t ~ U(0, 1)
-   - 构造直线路径：x_t = (1-t) * z + t * action_gt
-   - 目标速度：v_target = action_gt - z（直线路径上的常速度）
-   - 模型预测速度：v_pred = model(x_t, cond, t)
-   - Loss: MSE(v_pred, v_target)
-2. 推理：
-   - 从 z ~ N(0, I) 开始
-   - Euler 积分：x_{t+dt} = x_t + dt * model(x_t, cond, t)
-   - 10 步后输出作为动作
+"""Mag-VLA implementation for conditional flow matching. Action chunks describe planar
+increments for the left and right magnet-mounted arms.
 """
 
 import json
@@ -39,12 +21,9 @@ __all__ = ["MagVLAPolicy", "build_policy"]
 # Phase Head
 # ─────────────────────────────────────────────────────────────────────────────
 class PhaseHead(nn.Module):
-    """
-    输入: vlm_hidden [B, L, D], token_pad_mask [B, L] (True=padding, False=valid)
-    输出:
-        phase_logits   [B, 2]          # 分类 logits (用于 L_phase) — 2 类：approach vs transport
-        phase_token    [B, D]          # 可学习的 phase embedding (用于条件 ACT)
-        phase_id       [B]             # argmax(phase_logits) 推理时用
+    """Estimate approach or transport from pooled multimodal memory, the current arm
+    state and displacement over the history window. The selected phase indexes a
+    learned embedding for action decoding.
     """
 
     def __init__(self, hidden_dim: int = 3584, state_dim: int = 4, num_phases: int = 2):
@@ -52,13 +31,13 @@ class PhaseHead(nn.Module):
         self.num_phases = num_phases
         self.hidden_dim = hidden_dim
 
-        # 状态特征投影（当前位置）
+        # Project the current planar arm positions.
         self.state_proj_phase = nn.Linear(state_dim, 64)
 
-        # 运动方向投影（最新帧 - 最旧帧的状态差）
+        # Project the displacement across the state-history window.
         self.motion_proj = nn.Linear(state_dim, 64)
 
-        # 分类器：vision_pool(D) + state(64) + motion(64)
+        # Concatenate pooled memory with 64 position and 64 motion features.
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim + 128, 256),
             nn.ReLU(),
@@ -66,7 +45,7 @@ class PhaseHead(nn.Module):
             nn.Linear(256, num_phases),
         )
 
-        # 可学习的 phase embedding（给 ACT head 用）
+        # Embed the selected phase as an action-conditioning token.
         self.phase_embedding = nn.Embedding(num_phases, hidden_dim)
         nn.init.normal_(self.phase_embedding.weight, std=0.02)
 
@@ -78,10 +57,14 @@ class PhaseHead(nn.Module):
         state_normalized: Optional[torch.Tensor] = None,
         state_history: Optional[torch.Tensor] = None,
     ):
+        """Pool valid tokens in [B, L, D] memory. True mask entries denote padding.
+        Return two-class logits, the selected phase ID and its [B, D] embedding. A
+        supplied label selects the embedding only in training mode.
+        """
         B, L, D = vlm_hidden.shape
         dtype = vlm_hidden.dtype
 
-        # ── 1. Vision pool（masked mean pooling，同之前）──────────────
+        # Average valid memory tokens, excluding padding.
         if token_pad_mask is not None:
             valid_mask = (~token_pad_mask).unsqueeze(-1).to(dtype)
             valid_count = valid_mask.sum(dim=1).clamp_min(1.0)
@@ -89,24 +72,24 @@ class PhaseHead(nn.Module):
         else:
             vision_pool = vlm_hidden.mean(dim=1)
 
-        # ── 2. State 特征（当前位置）─────────────────────────────────
+        # Project the current planar arm positions before phase classification.
         if state_normalized is not None:
             state_feat = self.state_proj_phase(state_normalized.to(dtype))
         else:
             state_feat = torch.zeros(B, 64, device=vlm_hidden.device, dtype=dtype)
 
-        # ── 3. Motion 特征（运动方向 = 最新帧 - 最旧帧）─────────────
+        # Subtract the oldest state from the newest to estimate displacement.
         if state_history is not None:
             motion = state_history[:, -1, :] - state_history[:, 0, :]
             motion_feat = self.motion_proj(motion.to(dtype))
         else:
             motion_feat = torch.zeros(B, 64, device=vlm_hidden.device, dtype=dtype)
 
-        # ── 4. 拼接 → 分类 ──────────────────────────────────────────
+        # Concatenate pooled memory, position and motion before phase classification.
         combined = torch.cat([vision_pool, state_feat, motion_feat], dim=-1)
         phase_logits = self.classifier(combined)
 
-        # ── 5. Teacher forcing（训练）/ Argmax（推理）──────────────
+        # Use labelled phase in training when available and predicted phase in evaluation.
         if self.training and phase_gt is not None:
             phase_ids = phase_gt
         else:
@@ -121,43 +104,12 @@ class PhaseHead(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Flow Matching Chunk Head（conditional flow matching / rectified flow 小脑）
+# Conditional flow-matching action decoder.
 # ─────────────────────────────────────────────────────────────────────────────
 class FlowMatchingChunkHead(nn.Module):
-    """
-    输入:
-        vlm_hidden: [B, L, D]       # VLM backbone 输出
-        phase_token: [B, D]          # Phase Head 输出的条件向量
-        memory_pad_mask: [B, L]      # BoolTensor, True=padding
-        action_gt: [B, K, A] or None
-                                   # 训练时传入 → 计算 velocity 预测 MSE 损失
-                                   # 推理时传 None → 跑 Euler 积分
-
-    输出 (dict):
-        chunk_loss: scalar tensor or None
-        action_chunk: [B, K, A]    # 训练时 = action_gt（passthrough）
-                                   # 推理时 = Euler 积分结果
-
-    设计说明：
-    - 用 condition vector（pooled VLM hidden + phase_token）作为 velocity network 的 global condition
-    - Velocity network 与 diffusion 的 denoiser 结构完全相同（简单 MLP），便于公平对比
-    - 训练：
-        采样 z ~ N(0,I), t ~ U(0,1)
-        x_t = (1-t) * z + t * action_gt       ← 直线路径
-        v_target = action_gt - z              ← 沿直线的常速度
-        v_pred = MLP(x_t, cond, t_embed)
-        loss = MSE(v_pred, v_target)
-    - 推理：
-        x = z ~ N(0,I)
-        dt = 1/num_inference_steps
-        for i in range(num_inference_steps):
-            t = i * dt
-            v = MLP(x, cond, t_embed)
-            x = x + dt * v
-        return x
-    - dtype 处理：路径构造用 fp32（数值稳定），MLP 跟随 vlm_hidden 的 dtype（bf16）
-    - 时间 embedding：t ∈ [0,1] 连续，通过 TIME_SCALE 放大到 ~1000 级别再过 sinusoidal
-      （避免所有 t 落在低频部分导致 embedding 无法区分）
+    """Learn the velocity along a straight path from Gaussian noise to a demonstrated
+    action chunk. At inference, Euler updates integrate the learned field from time
+    zero to one.
     """
 
     def __init__(
@@ -181,19 +133,19 @@ class FlowMatchingChunkHead(nn.Module):
 
         action_flat = chunk_size * action_dim  # 5 * 4 = 20
 
-        # 条件投影：vlm_hidden 池化 + phase_token
+        # Condition on pooled memory and the phase token.
         self.vlm_proj = nn.Linear(hidden_dim, cond_dim)
         self.phase_proj = nn.Linear(hidden_dim, cond_dim)
 
-        # 时间 embedding（sinusoidal → MLP）
+        # Project the sinusoidal time embedding with an MLP.
         self.time_mlp = nn.Sequential(
             nn.Linear(time_dim, time_dim),
             nn.SiLU(),
             nn.Linear(time_dim, time_dim),
         )
 
-        # Velocity network MLP（输入：x_t + cond + time_emb）
-        # 结构与 diffusion denoiser 完全相同，便于公平对比
+        # Predict velocity from the interpolated action, conditioning and time.
+        # Use the same MLP structure as the diffusion denoiser for the comparison.
         net_in = action_flat + cond_dim * 2 + time_dim
         net_hidden = 512
         self.velocity_net = nn.Sequential(
@@ -205,7 +157,7 @@ class FlowMatchingChunkHead(nn.Module):
             nn.SiLU(),
             nn.Linear(net_hidden, action_flat),
         )
-        # 输出层初始化为 0，让初始速度接近 0（稳定的训练起点）
+        # Start the velocity predictor at zero.
         nn.init.zeros_(self.velocity_net[-1].weight)
         nn.init.zeros_(self.velocity_net[-1].bias)
 
@@ -216,7 +168,7 @@ class FlowMatchingChunkHead(nn.Module):
         returns: [B, time_dim] fp32
         """
         device = t.device
-        # Scale t ∈ [0,1] → [0, time_scale] 避免低频部分退化
+        # Scale continuous time before computing the sinusoidal features.
         t_scaled = t.float() * self.time_scale
 
         half = self.time_dim // 2
@@ -235,8 +187,8 @@ class FlowMatchingChunkHead(nn.Module):
         phase_token: torch.Tensor,
         memory_pad_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """
-        构造条件向量：masked mean pool(vlm_hidden) + phase_token → [B, 2*cond_dim]
+        """Pool valid VLM tokens and combine their projected representation with the
+        phase embedding to condition every sampling step.
         """
         dtype = vlm_hidden.dtype
         if memory_pad_mask is not None:
@@ -257,7 +209,9 @@ class FlowMatchingChunkHead(nn.Module):
         cond: torch.Tensor,      # [B, 2*cond_dim]
         t: torch.Tensor,         # [B] float in [0, 1]
     ) -> torch.Tensor:
-        """单步 velocity 预测：输入 x_t flat + cond + continuous time → 预测速度 flat"""
+        """Predict the flattened chunk velocity from its current location, continuous
+        time and observation conditioning.
+        """
         t_emb_fp32 = self._sinusoidal_time_embed(t)                     # [B, time_dim] fp32
         t_emb = self.time_mlp(t_emb_fp32.to(cond.dtype))                # [B, time_dim] cond.dtype
 
@@ -271,11 +225,10 @@ class FlowMatchingChunkHead(nn.Module):
         memory_pad_mask: Optional[torch.Tensor] = None,
         action_gt: Optional[torch.Tensor] = None,
     ) -> dict:
-        """
-        训练模式（action_gt 提供）:
-            返回 {"chunk_loss": velocity_mse, "action_chunk": action_gt 占位}
-        推理模式（action_gt = None）:
-            返回 {"chunk_loss": None, "action_chunk": Euler 积分结果}
+        """With action_gt, return velocity MSE and pass through the demonstrated chunk
+        for logging. Omit action_gt to generate a new chunk using Euler integration.
+        Only this sampling path returns actions suitable for comparison with
+        demonstrations.
         """
         B = vlm_hidden.shape[0]
         device = vlm_hidden.device
@@ -284,28 +237,28 @@ class FlowMatchingChunkHead(nn.Module):
 
         if action_gt is not None:
             # ════════════════════════════════════════════════════════════
-            # 训练 / eval 监控：conditional flow matching loss
+            # Monitor the conditional flow-matching objective.
             # ════════════════════════════════════════════════════════════
             action_gt_fp32 = action_gt.float()                              # [B, K, A]
 
-            # 随机采样连续时间 t ∈ [0, 1]
+            # Sample a continuous path time between zero and one.
             t = torch.rand(B, device=device, dtype=torch.float32)            # [B]
 
-            # 采样高斯噪声作为路径起点
+            # Use a Gaussian sample as the starting point of the path.
             z = torch.randn_like(action_gt_fp32)                             # [B, K, A] fp32
 
-            # 构造直线路径：x_t = (1-t) * z + t * action_gt
-            # t shape [B] → [B, 1, 1] 广播
+            # Interpolate linearly from the noise sample to the demonstration.
+            # Broadcast one sampled time over all steps and axes of each chunk.
             t_expand = t.view(B, 1, 1)
             x_t = (1.0 - t_expand) * z + t_expand * action_gt_fp32           # [B, K, A] fp32
 
-            # 目标速度：dx/dt = action_gt - z（直线路径上的常速度）
+            # The target velocity is constant along the straight path from noise to data.
             v_target = action_gt_fp32 - z                                    # [B, K, A] fp32
 
-            # 转回 cond 的 dtype 给 velocity network
+            # Cast back to the conditioning dtype for the velocity network.
             x_t_flat = x_t.flatten(1).to(cond.dtype)                         # [B, K*A]
 
-            # 预测速度
+            # Predict the velocity along the interpolation path.
             v_pred_flat = self._velocity_step(x_t_flat, cond, t)
             v_pred = v_pred_flat.view(B, self.chunk_size, self.action_dim)
 
@@ -314,30 +267,30 @@ class FlowMatchingChunkHead(nn.Module):
 
             return {
                 "chunk_loss": loss,
-                "action_chunk": action_gt,  # passthrough，便于训练日志
+                "action_chunk": action_gt,  # Expose this value for training logs.
             }
         else:
             # ════════════════════════════════════════════════════════════
-            # 推理：Euler 积分 t: 0 → 1
+            # Integrate the predicted velocity from time zero to one.
             # ════════════════════════════════════════════════════════════
             N = self.num_inference_steps
             dt = 1.0 / N
 
-            # 从随机噪声开始（t=0 端点）
+            # Start the continuous flow at Gaussian noise at time zero.
             x = torch.randn(
                 B, self.chunk_size, self.action_dim,
                 device=device, dtype=torch.float32,
             )
 
-            # Euler 积分：x_{t+dt} = x_t + dt * v(x_t, t)
-            # 使用离散的 time steps: t_i = i * dt, i = 0, 1, ..., N-1
+            # Advance the trajectory by dt times the predicted velocity.
+            # Evaluate the velocity at the start of each Euler interval.
             for i in range(N):
                 t_scalar = i * dt
                 t_batch = torch.full(
                     (B,), t_scalar, device=device, dtype=torch.float32
                 )
 
-                # 转 cond 的 dtype 给 velocity network
+                # Match the velocity network's conditioning dtype.
                 x_flat = x.flatten(1).to(cond.dtype)
                 v_pred_flat = self._velocity_step(x_flat, cond, t_batch)
                 v_pred = v_pred_flat.view(
@@ -357,19 +310,9 @@ class FlowMatchingChunkHead(nn.Module):
 # MagVLAPolicy
 # ─────────────────────────────────────────────────────────────────────────────
 class MagVLAPolicy(nn.Module):
-    """
-    完整 MagVLA Policy，包含:
-        - VLM Backbone (Qwen2.5-VL-7B + LoRA)
-        - State Conditioning: 机器人状态 Linear(4, D) → state token，拼入 VLM hidden
-        - Phase Head (2 分类: approach vs transport，with masked mean pooling + state + motion 输入)
-        - Flow Matching Chunk Head (conditional flow matching 小脑)
-
-    关键修改 (v13-flow):
-        - DiffusionChunkHead → FlowMatchingChunkHead（Euler 积分）
-        - 不再依赖 diffusers 库
-        - chunk_loss 改为 velocity prediction MSE（在 head 内部计算）
-        - 训练时 head 构造直线路径并预测 velocity
-        - 推理时 head 跑 Euler 积分（10 步）生成动作
+    """Combine the LoRA-adapted Qwen vision-language backbone, measured arm state and
+    motion-aware phase classifier with conditional flow matching for action
+    prediction.
     """
 
     def __init__(
@@ -386,7 +329,7 @@ class MagVLAPolicy(nn.Module):
         self.image_history = image_history
         self.image_downscale = image_downscale
 
-        # ── 1. 加载 VLM backbone ───────────────────────────────────────
+        # Load the pretrained vision-language backbone.
         model_config = Qwen2_5_VLConfig.from_pretrained(vlm_name)
         model_config.vision_config.hidden_size = 1280
 
@@ -416,16 +359,16 @@ class MagVLAPolicy(nn.Module):
             self.vlm = get_peft_model(self.vlm, lora_cfg)
             self.vlm.print_trainable_parameters()
 
-        # Freeze 非 LoRA 参数
+        # Freeze backbone parameters outside the LoRA adapters.
         for name, param in self.vlm.named_parameters():
             if "lora" not in name.lower():
                 param.requires_grad = False
 
-        # ── 3. 辅助 heads ─────────────────────────────────────────────
+        # Construct the task-specific heads.
         self.state_proj = nn.Linear(4, hidden_dim)
         self.phase_head = PhaseHead(hidden_dim=hidden_dim, state_dim=4, num_phases=2)
-        # 注意：变量名仍叫 act_head 以保持和 train_ddp.py / inference 代码兼容，
-        # 但实际是 FlowMatchingChunkHead 实例（conditional flow matching 小脑）
+        # Keep the act_head attribute name for training and inference callers.
+        # This variant assigns the velocity decoder to that attribute.
         self.act_head = FlowMatchingChunkHead(
             hidden_dim=hidden_dim,
             action_dim=4,
@@ -434,7 +377,7 @@ class MagVLAPolicy(nn.Module):
             time_scale=config.FLOW_TIME_SCALE,
         )
 
-        # ── 4. 移动到 GPU ───────────────────────────────────────────────
+        # Move the model components to the configured device.
         self.state_proj = self.state_proj.to(device, dtype=config.VLM_DTYPE)
         self.phase_head = self.phase_head.to(device, dtype=config.VLM_DTYPE)
         self.act_head = self.act_head.to(device, dtype=config.VLM_DTYPE)
@@ -442,10 +385,13 @@ class MagVLAPolicy(nn.Module):
         self._device = device
 
     def _get_device(self) -> str:
-        """动态获取模型所在的设备"""
+        """Return the device of the backbone parameters."""
         return next(self.vlm.parameters()).device
 
     def _resize_image(self, img: np.ndarray) -> np.ndarray:
+        """Resize a single image to configured height and width when downsampling is
+        enabled.
+        """
         if self.image_downscale is not None:
             import cv2
             h, w = self.image_downscale
@@ -453,22 +399,16 @@ class MagVLAPolicy(nn.Module):
         return img
 
     def _run_vlm(self, images: torch.Tensor, task_texts: list) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        VLM 前向传播：返回 (vlm_hidden, vlm_pad_mask)
-
-        images: [B, T, H, W, 3] uint8 tensor，RGB
-        task_texts: list of str, len = B
-
-        返回:
-            vlm_hidden: [B, L, D]
-            vlm_pad_mask: [B, L] BoolTensor, True=padding, False=valid
+        """Encode RGB history [B, T, H, W, 3] and one task string per sample. Return
+        padded hidden states [B, L, D] and a Boolean [B, L] mask with True at padded
+        positions.
         """
         B, T = images.shape[0], images.shape[1]
 
         hidden_states_list = []
         original_lengths = []
         for b in range(B):
-            # ── 将 4 帧转换为 PIL Images ─────────────────────────────────
+            # Convert the observation history to PIL images for the processor.
             pil_images = []
             for t in range(T):
                 img_np = images[b, t].cpu().numpy()
@@ -476,7 +416,7 @@ class MagVLAPolicy(nn.Module):
                 pil_img = Image.fromarray(img_np.astype(np.uint8))
                 pil_images.append(pil_img)
 
-            # ── 构造多图 message ─────────────────────────────────────────
+            # Package the image history and task prompt for the VLM processor.
             content = [{"type": "image"} for _ in range(T)]
             content.append({"type": "text", "text": task_texts[b]})
             message = [{"role": "user", "content": content}]
@@ -502,7 +442,7 @@ class MagVLAPolicy(nn.Module):
             hidden_states_list.append(hs)
             original_lengths.append(hs.shape[1])
 
-        # ── Padding 到统一长度，并构造 mask ─────────────────────────────
+        # Pad memory sequences to a common length and mark padded positions.
         if B == 1:
             return hidden_states_list[0], torch.zeros(
                 (1, hidden_states_list[0].shape[1]),
@@ -538,22 +478,14 @@ class MagVLAPolicy(nn.Module):
         vlm_pad_mask: torch.Tensor,
         state: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        将机器人状态注入 VLM hidden state 序列，同时更新 mask。
-
-        vlm_hidden:   [B, L, D]
-        vlm_pad_mask: [B, L] BoolTensor, True=padding
-        state:        [B, 4] 当前双臂 UMP 位置（normalized）
-
-        返回:
-            vlm_hidden:   [B, 1+L, D]  state token 拼在最前面
-            vlm_pad_mask: [B, 1+L]    state token 位置是 False（valid）
+        """Prepend the projected four-axis arm state to each memory sequence. Return [B,
+        L+1, D] hidden states and a matching mask whose first entry is valid.
         """
         state_token = self.state_proj(state.to(dtype=self.state_proj.weight.dtype))  # [B, D]
         state_token = state_token.unsqueeze(1)  # [B, 1, D]
         vlm_hidden = torch.cat([state_token, vlm_hidden], dim=1)  # [B, 1+L, D]
 
-        # state token 是真实 token，不是 padding，所以拼 False
+        # Append False because the measured-state token is valid.
         state_valid = torch.zeros(vlm_hidden.shape[0], 1, dtype=torch.bool, device=vlm_hidden.device)
         vlm_pad_mask = torch.cat([state_valid, vlm_pad_mask], dim=1)  # [B, 1+L]
 
@@ -569,14 +501,10 @@ class MagVLAPolicy(nn.Module):
         action_delta_gt: Optional[torch.Tensor] = None,
         state_history: Optional[torch.Tensor] = None,
     ) -> dict:
-        """
-        前向传播（走完整 mask 链路，不绕 DDP）。
-
-        images:     [B, T=4, H, W, 3] uint8，RGB
-        task_texts: [B] str
-        states:     [B, 4] float32，normalized，双臂 UMP 位置
-        phase_gt:   [B] long，训练时用于 phase_loss，推理时为 None
-        state_history: [B, 4, 4] normalized 4 帧历史状态
+        """Map RGB history, task text and normalised arm states to phase logits and a
+        five-step chunk. Each step has four coordinates ordered as left x, left y,
+        right x, right y. For inference, use evaluation mode and omit ground-truth
+        phase and action targets.
         """
         # ── 1. VLM Backbone → (hidden, pad_mask) ───────────────────────
         vlm_hidden, vlm_pad_mask = self._run_vlm(images, task_texts)
@@ -595,7 +523,7 @@ class MagVLAPolicy(nn.Module):
         phase_logits = phase_out["phase_logits"]
         phase_token = phase_out["phase_token"]
 
-        # ── 4. Flow Matching Chunk Head（传入 action_gt 用于训练构造直线路径，None 用于推理 Euler 积分）─
+        # With targets, predict path velocity. Without targets, integrate with Euler steps.
         chunk_out = self.act_head(
             vlm_hidden,
             phase_token,
@@ -603,9 +531,9 @@ class MagVLAPolicy(nn.Module):
             action_gt=action_delta_gt,
         )
         action_chunk = chunk_out["action_chunk"]
-        fm_chunk_loss = chunk_out["chunk_loss"]  # velocity MSE，or None 当推理时
+        fm_chunk_loss = chunk_out["chunk_loss"]  # Velocity-prediction MSE when a target chunk is supplied.
 
-        # ── 5. 损失（训练时）──────────────────────────────────────────────
+        # Compute the supervised objectives when requested.
         if return_loss:
             if phase_gt is not None:
                 phase_loss = F.cross_entropy(phase_logits, phase_gt)
@@ -643,7 +571,9 @@ class MagVLAPolicy(nn.Module):
         action_delta_gt: torch.Tensor,
         state_history: Optional[torch.Tensor] = None,
     ) -> dict:
-        """带完整损失计算的前向传播，数据流与 forward() 一致。"""
+        """Compute both supervised objectives from the supplied phase labels and action
+        chunks. Return the combined loss, its components and the policy outputs.
+        """
         # ── 1. VLM Backbone ──────────────────────────────────────────
         vlm_hidden, vlm_pad_mask = self._run_vlm(images, task_texts)
 
@@ -671,7 +601,7 @@ class MagVLAPolicy(nn.Module):
         action_chunk = chunk_out["action_chunk"]
         fm_chunk_loss = chunk_out["chunk_loss"]  # velocity prediction MSE
 
-        # ── 5. 完整损失 ────────────────────────────────────────────────
+        # Combine the action and phase losses.
         phase_loss = F.cross_entropy(phase_logits, phase_gt)
         chunk_loss = fm_chunk_loss
         loss = chunk_loss + config.LAMBDA_PHASE * phase_loss
@@ -687,9 +617,10 @@ class MagVLAPolicy(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 工厂函数
+# Policy and optimiser construction.
 # ─────────────────────────────────────────────────────────────────────────────
 def build_policy(device: str = config.DEVICE) -> MagVLAPolicy:
+    """Construct the configured policy on the requested device."""
     policy = MagVLAPolicy(
         vlm_name=config.VLM_NAME,
         chunk_size=config.CHUNK_SIZE,
@@ -702,7 +633,9 @@ def build_policy(device: str = config.DEVICE) -> MagVLAPolicy:
 
 
 def get_optimizer(policy: MagVLAPolicy, total_steps: int):
-    """分别优化 VLM (LoRA) 和两个 Head"""
+    """Return AdamW with separate learning-rate groups for adapters and task-specific
+    layers, together with the warm-up, plateau and cosine scheduler.
+    """
     lora_params = [p for n, p in policy.vlm.named_parameters() if "lora" in n.lower()]
 
     optimizer = torch.optim.AdamW(
@@ -726,10 +659,13 @@ def get_optimizer(policy: MagVLAPolicy, total_steps: int):
         ]
     )
 
-    # Warmup + Plateau + Cosine decay（不归零）
+    # Warm up, hold the learning rate, then apply cosine decay to a positive floor.
     import math
 
     def lr_lambda(step):
+        """Return the multiplier applied to each parameter group at the given
+        optimisation step.
+        """
         warmup = config.WARMUP_STEPS
         plateau = config.PLATEAU_STEPS
         min_ratio = config.MIN_LR_RATIO

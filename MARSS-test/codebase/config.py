@@ -1,21 +1,16 @@
-"""
-MagVLA 配置 - Version 13 (IX GPU Cloud 版，2-Phase + Direct Prompt Injection)
-
-关键修改（相对 v13 原版）：
-- PhaseHead num_phases 从 3 改为 2
-- **新增直接 prompt 注入路径**：DistilBERT 编码 task_text → text_proj → text_token → 注入 ACT 小脑
-- 动机：真机实验中 prompt 信息被 vision tokens 稀释，小脑无法区分任务
-- 数据路径适配 IX 集群 /vol/bitbucket/$USER/ 路径
+"""Experiment settings for ACT with an additional DistilBERT instruction token. DATA_DIR
+points to recorded demonstrations. BATCH_SIZE counts samples per GPU microbatch and
+ACCUM_STEPS sets the number of microbatches per optimiser update.
 """
 
 import os
 from pathlib import Path
 import torch
 
-# ── 数据集（IX 集群路径，由 SLURM $USER 自动填充）─────────────────────────
+# Dataset root.
 DATA_DIR = Path(os.environ.get("MARSS_DATA_DIR", "lerobot_datasetV2")).expanduser()
 
-# ── 模型 ───────────────────────────────────────────────────────────────────
+# Backbone and input dimensions.
 VLM_NAME = "Qwen/Qwen2.5-VL-7B-Instruct"
 VLM_DTYPE = torch.bfloat16
 IMAGE_H, IMAGE_W = 960, 1280
@@ -26,7 +21,7 @@ CHUNK_SIZE = 5
 
 IMAGE_DOWNSCALE = (448, 448)
 
-# ── 训练 ─────────────────────────────────────────────────────────────────────
+# Optimisation settings.
 BATCH_SIZE = 2
 ACCUM_STEPS = 8
 
@@ -45,7 +40,7 @@ GRAD_CLIP = 1.0
 
 LAMBDA_PHASE = 0.5
 
-# ── 日志 / 保存 ─────────────────────────────────────────────────────────────
+# Logging and checkpoint intervals.
 LOG_INTERVAL = 10
 EVAL_INTERVAL = 250
 SAVE_INTERVAL = 500
@@ -63,5 +58,5 @@ LORA_ALPHA = 32
 LORA_DROPOUT = 0.10
 LORA_TARGET_MODULES = ["q_proj", "v_proj"]
 
-# ── 设备 ───────────────────────────────────────────────────────────────────
+# Device selection.
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

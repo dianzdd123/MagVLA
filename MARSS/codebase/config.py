@@ -1,42 +1,38 @@
-"""
-MagVLA 配置 - Version 13 (2-Phase: 删除 return，保留 approach vs transport)
-
-关键修改（相对 v11）：
-- PhaseHead num_phases 从 3 改为 2
-- 数据集过滤掉 phase==2 的帧
-- RUN_NAME 更新为 v13-2phase-no-return
+"""Experiment settings for phase-conditioned ACT. DATA_DIR points to recorded
+demonstrations. BATCH_SIZE counts samples per GPU microbatch and ACCUM_STEPS sets the
+number of microbatches per optimiser update.
 """
 
 import os
 from pathlib import Path
 import torch
 
-# ── 数据集 ──────────────────────────────────────────────────────────────────
+# Dataset root.
 DATA_DIR = Path(os.environ.get("MARSS_DATA_DIR", "lerobot_datasetV2")).expanduser()
 
-# ── 模型 ───────────────────────────────────────────────────────────────────
+# Backbone and input dimensions.
 VLM_NAME = "Qwen/Qwen2.5-VL-7B-Instruct"
-VLM_DTYPE = torch.bfloat16   # Qwen2.5-VL 官方推荐 bfloat16
-IMAGE_H, IMAGE_W = 960, 1280  # 与数据集分辨率一致
+VLM_DTYPE = torch.bfloat16   # Use bfloat16 for the vision-language backbone.
+IMAGE_H, IMAGE_W = 960, 1280  # Height and width of the recorded frames.
 IMAGE_HW = (IMAGE_H, IMAGE_W)
 
-# 历史帧数（observation.images.main 窗口）
+# Number of main-camera frames in the observation window.
 IMAGE_HISTORY = 4
 
-# ACT chunk size（预测未来多少步）
+# Number of future action steps predicted per observation.
 CHUNK_SIZE = 5
 
-# ── 图像下采样到更小分辨率加速训练（与 MagVLA 文档一致）
-IMAGE_DOWNSCALE = (448, 448)  # H×W，448 是 Qwen2-VL 推荐倍数（14×32）
+# Resize images for the vision-language backbone.
+IMAGE_DOWNSCALE = (448, 448)  # Input height and width, both multiples of the visual patch size.
 
-# ── 训练 (version13: True 4-GPU DDP, 2-Phase) ──────────────────────────────
+# Distributed training for the two manipulation phases.
 BATCH_SIZE = 2              # per-GPU micro batch
 ACCUM_STEPS = 8            # true 4GPU global batch = 2 * 4 * 8 = 64
 
-# 学习率
+# Learning rates for the parameter groups.
 LR = 1e-4                  # LoRA
 LR_ACT_HEAD = 1.5e-4       # ACT head + state_proj
-LR_PHASE_HEAD = 1.5e-4     # Phase head（含 state_proj_phase + motion_proj）
+LR_PHASE_HEAD = 1.5e-4     # Phase classifier, including state and motion projections.
 
 WEIGHT_DECAY = 0.01
 
@@ -48,10 +44,10 @@ MIN_LR_RATIO = 0.1
 MAX_STEPS = 5000
 GRAD_CLIP = 1.0
 
-# 损失权重
+# Weight of the phase loss in the joint objective.
 LAMBDA_PHASE = 0.5
 
-# ── 日志 / 保存 ─────────────────────────────────────────────────────────────
+# Logging and checkpoint intervals.
 LOG_INTERVAL = 10
 EVAL_INTERVAL = 250
 SAVE_INTERVAL = 500
@@ -72,5 +68,5 @@ LORA_TARGET_MODULES = [
     "v_proj",
 ]
 
-# ── 设备 ───────────────────────────────────────────────────────────────────
+# Device selection.
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

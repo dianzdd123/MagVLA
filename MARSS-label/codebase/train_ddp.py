@@ -1,21 +1,6 @@
-"""
-MagVLA 训练主脚本 - True 4-GPU DDP 版本
-
-关键设计（与 v10/v11 一致）：
-- torchrun --nproc_per_node=4 启动真 DDP
-- 每个 GPU 各自加载模型（不重复加载）
-- DistributedSampler 分配数据，每个 rank 看到不同的 batch
-- 前 ACCUM_STEPS-1 个 micro-step 用 model.no_sync() 跳过 all-reduce
-- 最后一个 micro-step 才 backward + clip + optimizer.step()
-- 只在 rank0 写 wandb / tensorboard / checkpoint
-- eval 时所有 rank 并行处理 val set，再 all_reduce 聚合
-
-v13-IX-label 关键修改（2-Phase + 圆圈标记）：
-- PhaseHead 添加 state_normalized + state_history (motion) 输入
-- 在图像输入 VLM 之前，先在原图(1290x960)上标记两个圆圈：
-    1. 红圆(object)：物体中心
-    2. 绿圆(target)：目标点
-- 标记完成后再下采样到 448x448 输入 VLM
+"""Distributed training and validation for ACT with object and target markers in the
+input images. Launch with torchrun so each process receives its rank and device
+assignment.
 """
 
 import os
@@ -34,7 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import wandb
 
-# -必须在导入 config 之前设置 PYTHONPATH ---
+# Set the module search path before importing this variant's configuration.
 sys.path.insert(0, str(Path(__file__).parent))
 
 import config
@@ -45,7 +30,9 @@ __all__ = ["train"]
 
 
 def collate_fn(batch):
-    """DataLoader 整理函数：对齐 batch 中每个 tensor 的形状"""
+    """Stack tensor fields along the batch dimension while preserving the order of the
+    task strings and their corresponding image histories.
+    """
     episode_indices = [b["episode_index"] for b in batch]
     frame_indices = [b["frame_index"] for b in batch]
     images = torch.stack([b["observation.images.main"] for b in batch])  # [B, T, H, W, 3]
@@ -68,10 +55,9 @@ def collate_fn(batch):
 
 @torch.no_grad()
 def evaluate(model: DDP, val_loader: DataLoader, rank: int, world_size: int) -> dict:
-    """
-    分布式正确 eval：
-    - 每个 rank 处理自己那部分 val set
-    - 通过 all_reduce 聚合到所有 rank
+    """Evaluate each rank’s validation shard with predicted phase conditioning. Sum
+    losses weighted by local sample count and reduce phase-correct counts across ranks
+    before dividing by the total.
     """
     model.eval()
 
@@ -97,7 +83,7 @@ def evaluate(model: DDP, val_loader: DataLoader, rank: int, world_size: int) -> 
         local_phase_correct += (preds == phase_gt).sum().item()
         local_samples += images.shape[0]
 
-    # --- all_reduce 聚合 ---
+    # Sum validation totals across ranks before computing averages.
     phase_loss_tensor = torch.tensor(local_phase_loss, dtype=torch.float64, device="cuda")
     chunk_loss_tensor = torch.tensor(local_chunk_loss, dtype=torch.float64, device="cuda")
     phase_correct_tensor = torch.tensor(local_phase_correct, dtype=torch.long, device="cuda")
@@ -127,7 +113,11 @@ def train(
     resume_from: str | Path | None = None,
     keep_checkpoints: int = 1,
 ):
-    # --- 0. DDP 初始化（由 torchrun 自动注入环境变量）-------------------------
+    # Initialise distributed training from the environment supplied by torchrun.
+    """Run one training process per GPU under torchrun. Accumulate local microbatch
+    gradients before synchronisation, periodically evaluate the model and write
+    checkpoints on rank zero.
+    """
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -147,7 +137,7 @@ def train(
 
     dist.barrier()
 
-    # --- 诊断信息 ---
+    # Report training diagnostics.
     if is_rank0:
         print("=" * 70)
         print(f"MagVLA Training - True 4-GPU DDP (v13-IX-label: 圆圈标记)")
@@ -193,7 +183,7 @@ def train(
         image_downscale=config.IMAGE_DOWNSCALE,
     )
 
-    # drop_last=True 确保每批 batch size 一致，避免 DDP rank 间 batch 大小不同
+    # Drop incomplete batches to keep the local batch sizes equal.
     train_sampler = DistributedSampler(
         train_ds, shuffle=True, drop_last=True,
     )
@@ -205,7 +195,7 @@ def train(
         train_ds,
         batch_size=config.BATCH_SIZE,
         sampler=train_sampler,
-        num_workers=0,   # 多卡 DDP 下 num_workers>0 容易导致 DataLoader worker 进程间竞争/死锁
+        num_workers=0,   # Load data in the rank process to avoid competing loader workers.
         collate_fn=collate_fn,
         pin_memory=True,
     )
@@ -226,7 +216,7 @@ def train(
 
     dist.barrier()
 
-    # --- 2. Policy（每个 rank 独立加载到自己的 GPU）--------------------------
+    # Each rank loads a policy replica on its assigned GPU.
     policy = MagVLAPolicy(
         vlm_name=config.VLM_NAME,
         chunk_size=config.CHUNK_SIZE,
@@ -268,7 +258,7 @@ def train(
 
     dist.barrier()
 
-    # --- 4. Logging（只 rank0）---------------------------------------------
+    # Only rank zero writes logs.
     writer = None
     if is_rank0:
         writer = SummaryWriter(log_dir=log_dir / config.RUN_NAME)
@@ -329,7 +319,7 @@ def train(
         epoch += 1
 
         for batch in train_loader:
-            # --- 新一轮 accumulation cycle ---------------------------------
+            # Start a fresh gradient accumulation cycle.
             if local_acc == 0:
                 optimizer.zero_grad(set_to_none=True)
                 accum_loss = 0.0
@@ -339,7 +329,7 @@ def train(
                 batch_action_gt_list = []
                 batch_grad_norms = []
 
-            # --- 加载数据 ---
+            # Load episode splits and construct data loaders.
             images = batch["observation.images.main"].to(device)
             states = batch["observation.state"].to(device)
             state_history = batch["state_history"].to(device)
@@ -348,8 +338,8 @@ def train(
             task_texts = batch["task_text"]
 
             # --- Forward Pass ---
-            # no_sync() 必须同时包裹 forward 和 backward，才不会触发梯度同步
-            is_last_accum = (local_acc == config.ACCUM_STEPS - 1)  # 当前这步之后，local_acc 会不会达到 ACCUM_STEPS-1
+            # Wrap both forward and backward in no_sync to defer gradient reduction.
+            is_last_accum = (local_acc == config.ACCUM_STEPS - 1)  # Check whether this microbatch closes the accumulation cycle.
             if is_last_accum:
                 out = model(
                     images, task_texts, states, phase_gt,
@@ -371,12 +361,12 @@ def train(
             batch_action_chunk_list.append(out["action_chunk"].detach())
             batch_action_gt_list.append(action_delta_gt.detach())
 
-            # local_acc 更新后，才正式成为"最后一个 micro-step"
+            # Update the counter before checking whether to step the optimiser.
             local_acc += 1
             is_last_accum = (local_acc == config.ACCUM_STEPS)
 
             if is_last_accum:
-                # 最后一步：正常 backward（触发 DDP all-reduce 同步梯度）
+                # Synchronise gradients on the final microbatch.
                 loss.backward()
 
                 total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP)
@@ -396,7 +386,7 @@ def train(
                         chunk=f"{accum_chunk_loss:.4f}",
                     )
             else:
-                # 前 N-1 步：no_sync 包裹 forward + backward，跳过 all-reduce
+                # Accumulate local gradients on intermediate microbatches.
                 loss.backward()
 
             # --- Logging（rank0）---------------------------------------------
@@ -445,9 +435,9 @@ def train(
                     step=global_step,
                 )
 
-            # --- Eval（所有 rank 都调用 evaluate() 进行 all_reduce，rank0 打印日志）--------------------
+            # All ranks contribute validation totals. Rank zero logs the results.
             if is_last_accum and global_step > 0 and global_step % config.EVAL_INTERVAL == 0:
-                metrics = evaluate(model, val_loader, rank, world_size)  # 所有 rank 都要调用
+                metrics = evaluate(model, val_loader, rank, world_size)  # Every rank participates in this collective.
                 if is_rank0:
                     tqdm.write(
                         f"  [Step {global_step}] val_phase_loss={metrics['val_phase_loss']:.4f}  "
@@ -467,14 +457,14 @@ def train(
                         step=global_step,
                     )
 
-                    # 只在 val chunk loss 更低时保存 best 模型（只保留 best + final）
+                    # Save a best checkpoint when validation chunk loss decreases.
                     current_val_chunk_loss = metrics["val_chunk_loss"]
                     if current_val_chunk_loss < best_val_chunk_loss:
                         old_best = best_ckpt_path
                         best_val_chunk_loss = current_val_chunk_loss
                         best_ckpt_path = ckpt_dir / f"step_{global_step}_best.pt"
 
-                        # 原子写入：先写临时文件，再重命名
+                        # Write a temporary checkpoint before replacing the destination.
                         tmp_path = best_ckpt_path.with_suffix(".tmp")
                         ckpt_data = {
                             "step": global_step,
@@ -494,7 +484,7 @@ def train(
                         torch.save(ckpt_data, tmp_path)
                         os.rename(tmp_path, best_ckpt_path)
 
-                        # 保存后立即验证完整性
+                        # Verify the newly written checkpoint.
                         try:
                             verify = torch.load(best_ckpt_path, map_location="cpu", weights_only=False)
                             tqdm.write(
@@ -506,7 +496,7 @@ def train(
                             tqdm.write(f"  [ERROR] Checkpoint verification failed: {e}")
                             raise
 
-                        # 删除旧的 best（只保留最新的 best）
+                        # Remove the previous best checkpoint after the new one is saved.
                         if old_best is not None and old_best.exists():
                             old_best.unlink()
                             tqdm.write(f"  [Old best deleted] {old_best.name}")
@@ -519,7 +509,7 @@ def train(
     if is_rank0:
         pbar.close()
 
-        # --- Final save（原子写入 + 验证）--------------------------------------------
+        # Write the final checkpoint atomically and verify the saved file.
         final_ckpt = ckpt_dir / "final.pt"
         tmp_final = final_ckpt.with_suffix(".tmp")
         ckpt_data = {
@@ -532,7 +522,7 @@ def train(
         torch.save(ckpt_data, tmp_final)
         os.rename(tmp_final, final_ckpt)
 
-        # 保存后立即验证
+        # Check the checkpoint after writing.
         try:
             verify = torch.load(final_ckpt, map_location="cpu", weights_only=False)
             print(f"\n训练完成！最终 checkpoint 已验证: {final_ckpt}")

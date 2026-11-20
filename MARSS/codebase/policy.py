@@ -1,10 +1,5 @@
-"""
-MagVLA Policy (Version 13 - 2-Phase: 删除 return，PhaseHead 改为 2 分类)
-
-关键修改（相对 v11）：
-- PhaseHead num_phases 从 3 改为 2（approach=0 vs transport=1）
-- 删除 return 阶段（phase=2）的数据帧
-- 解决 approach↔return 混淆问题（因为 return 根本不存在了）
+"""Mag-VLA implementation for phase-conditioned ACT. Action chunks describe planar
+increments for the left and right magnet-mounted arms.
 """
 
 import json
@@ -26,12 +21,9 @@ __all__ = ["MagVLAPolicy", "build_policy"]
 # Phase Head
 # ─────────────────────────────────────────────────────────────────────────────
 class PhaseHead(nn.Module):
-    """
-    输入: vlm_hidden [B, L, D], token_pad_mask [B, L] (True=padding, False=valid)
-    输出:
-        phase_logits   [B, 2]          # 分类 logits (用于 L_phase) — 2 类：approach vs transport
-        phase_token    [B, D]          # 可学习的 phase embedding (用于条件 ACT)
-        phase_id       [B]             # argmax(phase_logits) 推理时用
+    """Estimate approach or transport from pooled multimodal memory, the current arm
+    state and displacement over the history window. The selected phase indexes a
+    learned embedding for action decoding.
     """
 
     def __init__(self, hidden_dim: int = 3584, state_dim: int = 4, num_phases: int = 2):
@@ -39,13 +31,13 @@ class PhaseHead(nn.Module):
         self.num_phases = num_phases
         self.hidden_dim = hidden_dim
 
-        # 状态特征投影（当前位置）
+        # Project the current planar arm positions.
         self.state_proj_phase = nn.Linear(state_dim, 64)
 
-        # 运动方向投影（最新帧 - 最旧帧的状态差）
+        # Project the displacement across the state-history window.
         self.motion_proj = nn.Linear(state_dim, 64)
 
-        # 分类器：vision_pool(D) + state(64) + motion(64)
+        # Concatenate pooled memory with 64 position and 64 motion features.
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim + 128, 256),
             nn.ReLU(),
@@ -53,7 +45,7 @@ class PhaseHead(nn.Module):
             nn.Linear(256, num_phases),
         )
 
-        # 可学习的 phase embedding（给 ACT head 用）
+        # Embed the selected phase as an action-conditioning token.
         self.phase_embedding = nn.Embedding(num_phases, hidden_dim)
         nn.init.normal_(self.phase_embedding.weight, std=0.02)
 
@@ -65,10 +57,14 @@ class PhaseHead(nn.Module):
         state_normalized: Optional[torch.Tensor] = None,
         state_history: Optional[torch.Tensor] = None,
     ):
+        """Pool valid tokens in [B, L, D] memory. True mask entries denote padding.
+        Return two-class logits, the selected phase ID and its [B, D] embedding. A
+        supplied label selects the embedding only in training mode.
+        """
         B, L, D = vlm_hidden.shape
         dtype = vlm_hidden.dtype
 
-        # ── 1. Vision pool（masked mean pooling，同之前）──────────────
+        # Average valid memory tokens, excluding padding.
         if token_pad_mask is not None:
             valid_mask = (~token_pad_mask).unsqueeze(-1).to(dtype)
             valid_count = valid_mask.sum(dim=1).clamp_min(1.0)
@@ -76,24 +72,24 @@ class PhaseHead(nn.Module):
         else:
             vision_pool = vlm_hidden.mean(dim=1)
 
-        # ── 2. State 特征（当前位置）─────────────────────────────────
+        # Project the current planar arm positions before phase classification.
         if state_normalized is not None:
             state_feat = self.state_proj_phase(state_normalized.to(dtype))
         else:
             state_feat = torch.zeros(B, 64, device=vlm_hidden.device, dtype=dtype)
 
-        # ── 3. Motion 特征（运动方向 = 最新帧 - 最旧帧）─────────────
+        # Subtract the oldest state from the newest to estimate displacement.
         if state_history is not None:
             motion = state_history[:, -1, :] - state_history[:, 0, :]
             motion_feat = self.motion_proj(motion.to(dtype))
         else:
             motion_feat = torch.zeros(B, 64, device=vlm_hidden.device, dtype=dtype)
 
-        # ── 4. 拼接 → 分类 ──────────────────────────────────────────
+        # Concatenate pooled memory, position and motion before phase classification.
         combined = torch.cat([vision_pool, state_feat, motion_feat], dim=-1)
         phase_logits = self.classifier(combined)
 
-        # ── 5. Teacher forcing（训练）/ Argmax（推理）──────────────
+        # Use labelled phase in training when available and predicted phase in evaluation.
         if self.training and phase_gt is not None:
             phase_ids = phase_gt
         else:
@@ -108,23 +104,12 @@ class PhaseHead(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ACT Chunk Head（手动 MHA，完全控制 padding mask）
+# ACT attention uses explicit key-padding masks.
 # ─────────────────────────────────────────────────────────────────────────────
 class ACTChunkHead(nn.Module):
-    """
-    输入:
-        vlm_hidden: [B, L, D]       # VLM backbone 输出
-        phase_token: [B, D]         # Phase Head 输出的条件向量
-        memory_pad_mask: [B, L]     # BoolTensor, True=padding, False=valid
-                                   # （已含 phase_token 位置的 False）
-    输出:
-        action_chunk: [B, K, 4]     # 未来 K 步的 action_delta 预测
-
-    实现说明：
-    - 不使用 nn.MultiheadAttention（key_padding_mask 有维度校验问题）
-    - 使用手动 QKV 投影 + F.scaled_dot_product_attention
-    - self-attn 不需要 padding mask（queries 长度固定）
-    - cross-attn 只对 memory 施 padding mask
+    """Decode the full horizon in parallel. One learned query represents each future
+    step. Queries attend to one another and to phase-conditioned memory before
+    projection onto the four arm axes.
     """
 
     def __init__(self, hidden_dim: int = 3584, chunk_size: int = 5, num_layers: int = 2):
@@ -135,10 +120,10 @@ class ACTChunkHead(nn.Module):
         self.nhead = 8
         self.head_dim = hidden_dim // self.nhead  # 448
 
-        # 可学习的 action query（DERT 风格）
+        # Learn one DETR-style query per action step.
         self.action_queries = nn.Parameter(torch.randn(chunk_size, hidden_dim) * 0.02)
 
-        # 每层：LayerNorm → Self-Attn → LayerNorm → Cross-Attn → FFN
+        # Each block mixes action queries, attends to memory and applies a feed-forward layer.
         self.layers = nn.ModuleList([
             nn.ModuleDict({
                 # Self-attn: Q=K=V=queries
@@ -167,7 +152,7 @@ class ACTChunkHead(nn.Module):
 
         self.final_ln = nn.LayerNorm(hidden_dim)
 
-        # 投影到动作空间
+        # Project features to the action coordinates.
         self.action_proj = nn.Linear(hidden_dim, 4)
         nn.init.xavier_uniform_(self.action_proj.weight, gain=0.01)
         nn.init.zeros_(self.action_proj.bias)
@@ -179,9 +164,8 @@ class ACTChunkHead(nn.Module):
         v: torch.Tensor,      # [B, S, D]
         pad_mask: Optional[torch.Tensor] = None,  # [B, S] BoolTensor, True=masked
     ) -> torch.Tensor:
-        """
-        手动 multi-head attention + scaled dot-product attention。
-        pad_mask 只应用于 K/V 方向，Q 始终不被 mask。
+        """Compute multi-head scaled dot-product attention. The optional [B, S] mask
+        excludes padded keys before softmax. Recombine heads into a [B, T, D] output.
         """
         B, T, D = q.shape
         _, S, _ = k.shape
@@ -215,37 +199,36 @@ class ACTChunkHead(nn.Module):
         phase_token: torch.Tensor,
         memory_pad_mask: Optional[torch.Tensor] = None,
     ):
-        """
-        vlm_hidden: [B, L, D]
-        phase_token: [B, D]
-        memory_pad_mask: [B, L] True=padding（已含 phase_token 位置的 False）
+        """Return [B, K, 4] normalised action increments. Expand K learned queries per
+        sample, prepend conditioning tokens to memory and extend the padding mask to
+        match.
         """
         B, L, D = vlm_hidden.shape
 
-        # ── 构造 memory（phase_token 在最前面）────────────────────────────
+        # Prepend the phase token to the decoder memory.
         phase_token_seq = phase_token.unsqueeze(1)  # [B, 1, D]
         memory = torch.cat([phase_token_seq, vlm_hidden], dim=1)  # [B, 1+L, D]
 
-        # ── memory_pad_mask 拼接（phase_token 位置是 valid）────────────────
+        # Extend the mask with a valid entry for the phase token.
         if memory_pad_mask is not None:
             phase_false = torch.zeros(B, 1, dtype=torch.bool, device=vlm_hidden.device)
             mem_pad = torch.cat([phase_false, memory_pad_mask], dim=1)  # [B, 1+L]
         else:
             mem_pad = torch.zeros(B, 1 + L, dtype=torch.bool, device=vlm_hidden.device)
 
-        # ── 构造 queries ───────────────────────────────────────────────
+        # Expand the learned action queries across the batch.
         queries = self.action_queries.unsqueeze(0).expand(B, -1, -1)  # [B, K, D]
 
-        # ── 多层 transformer blocks ─────────────────────────────────────
+        # Apply the stacked decoder blocks.
         for layer in self.layers:
             q = queries
 
-            # Self-attention（queries 长度固定 K，无 padding）
+            # The fixed-length query sequence has no padding.
             q_ln = layer["ln1"](q)
             attn_out = self._attn(layer["wq1"](q_ln), layer["wk1"](q_ln), layer["wv1"](q_ln))
             queries = q + layer["out1"](attn_out)
 
-            # Cross-attention（queries → memory，使用 padding mask）
+            # Each query attends to valid memory tokens.
             q_ln = layer["ln2"](queries)
             cross_out = self._attn(
                 layer["wq2"](q_ln),
@@ -260,7 +243,7 @@ class ACTChunkHead(nn.Module):
 
         queries = self.final_ln(queries)
 
-        # ── 投影到动作空间 ───────────────────────────────────────────────
+        # Map each decoded query to the four arm-action coordinates.
         action_chunk = self.action_proj(queries)  # [B, K, 4]
 
         return action_chunk
@@ -270,16 +253,8 @@ class ACTChunkHead(nn.Module):
 # MagVLAPolicy
 # ─────────────────────────────────────────────────────────────────────────────
 class MagVLAPolicy(nn.Module):
-    """
-    完整 MagVLA Policy，包含:
-        - VLM Backbone (Qwen2.5-VL-7B + LoRA)
-        - State Conditioning: 机器人状态 Linear(4, D) → state token，拼入 VLM hidden
-        - Phase Head (2 分类: approach vs transport，with masked mean pooling + state + motion 输入)
-        - ACT Chunk Head (with manual MHA padding mask)
-
-    关键修改 (v13):
-        - PhaseHead num_phases 从 3 改为 2
-        - 训练数据过滤掉所有 phase==2 的帧
+    """Combine the LoRA-adapted Qwen vision-language backbone, measured arm state and
+    motion-aware phase classifier with phase-conditioned ACT for action prediction.
     """
 
     def __init__(
@@ -296,7 +271,7 @@ class MagVLAPolicy(nn.Module):
         self.image_history = image_history
         self.image_downscale = image_downscale
 
-        # ── 1. 加载 VLM backbone ───────────────────────────────────────
+        # Load the pretrained vision-language backbone.
         model_config = Qwen2_5_VLConfig.from_pretrained(vlm_name)
         model_config.vision_config.hidden_size = 1280
 
@@ -325,17 +300,17 @@ class MagVLAPolicy(nn.Module):
             self.vlm = get_peft_model(self.vlm, lora_cfg)
             self.vlm.print_trainable_parameters()
 
-        # Freeze 非 LoRA 参数
+        # Freeze backbone parameters outside the LoRA adapters.
         for name, param in self.vlm.named_parameters():
             if "lora" not in name.lower():
                 param.requires_grad = False
 
-        # ── 3. 辅助 heads ─────────────────────────────────────────────
+        # Construct the task-specific heads.
         self.state_proj = nn.Linear(4, hidden_dim)
         self.phase_head = PhaseHead(hidden_dim=hidden_dim, state_dim=4, num_phases=2)
         self.act_head = ACTChunkHead(hidden_dim=hidden_dim, chunk_size=chunk_size, num_layers=2)
 
-        # ── 4. 移动到 GPU ───────────────────────────────────────────────
+        # Move the model components to the configured device.
         self.state_proj = self.state_proj.to(device, dtype=config.VLM_DTYPE)
         self.phase_head = self.phase_head.to(device, dtype=config.VLM_DTYPE)
         self.act_head = self.act_head.to(device, dtype=config.VLM_DTYPE)
@@ -343,6 +318,9 @@ class MagVLAPolicy(nn.Module):
         self.device = device
 
     def _resize_image(self, img: np.ndarray) -> np.ndarray:
+        """Resize a single image to configured height and width when downsampling is
+        enabled.
+        """
         if self.image_downscale is not None:
             import cv2
             h, w = self.image_downscale
@@ -350,22 +328,16 @@ class MagVLAPolicy(nn.Module):
         return img
 
     def _run_vlm(self, images: torch.Tensor, task_texts: list) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        VLM 前向传播：返回 (vlm_hidden, vlm_pad_mask)
-
-        images: [B, T, H, W, 3] uint8 tensor，RGB
-        task_texts: list of str, len = B
-
-        返回:
-            vlm_hidden: [B, L, D]
-            vlm_pad_mask: [B, L] BoolTensor, True=padding, False=valid
+        """Encode RGB history [B, T, H, W, 3] and one task string per sample. Return
+        padded hidden states [B, L, D] and a Boolean [B, L] mask with True at padded
+        positions.
         """
         B, T = images.shape[0], images.shape[1]
 
         hidden_states_list = []
         original_lengths = []
         for b in range(B):
-            # ── 将 4 帧转换为 PIL Images ─────────────────────────────────
+            # Convert the observation history to PIL images for the processor.
             pil_images = []
             for t in range(T):
                 img_np = images[b, t].cpu().numpy()
@@ -373,7 +345,7 @@ class MagVLAPolicy(nn.Module):
                 pil_img = Image.fromarray(img_np.astype(np.uint8))
                 pil_images.append(pil_img)
 
-            # ── 构造多图 message ─────────────────────────────────────────
+            # Package the image history and task prompt for the VLM processor.
             content = [{"type": "image"} for _ in range(T)]
             content.append({"type": "text", "text": task_texts[b]})
             message = [{"role": "user", "content": content}]
@@ -399,7 +371,7 @@ class MagVLAPolicy(nn.Module):
             hidden_states_list.append(hs)
             original_lengths.append(hs.shape[1])
 
-        # ── Padding 到统一长度，并构造 mask ─────────────────────────────
+        # Pad memory sequences to a common length and mark padded positions.
         if B == 1:
             return hidden_states_list[0], torch.zeros(
                 (1, hidden_states_list[0].shape[1]),
@@ -435,22 +407,14 @@ class MagVLAPolicy(nn.Module):
         vlm_pad_mask: torch.Tensor,
         state: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        将机器人状态注入 VLM hidden state 序列，同时更新 mask。
-
-        vlm_hidden:   [B, L, D]
-        vlm_pad_mask: [B, L] BoolTensor, True=padding
-        state:        [B, 4] 当前双臂 UMP 位置（normalized）
-
-        返回:
-            vlm_hidden:   [B, 1+L, D]  state token 拼在最前面
-            vlm_pad_mask: [B, 1+L]    state token 位置是 False（valid）
+        """Prepend the projected four-axis arm state to each memory sequence. Return [B,
+        L+1, D] hidden states and a matching mask whose first entry is valid.
         """
         state_token = self.state_proj(state.to(dtype=self.state_proj.weight.dtype))  # [B, D]
         state_token = state_token.unsqueeze(1)  # [B, 1, D]
         vlm_hidden = torch.cat([state_token, vlm_hidden], dim=1)  # [B, 1+L, D]
 
-        # state token 是真实 token，不是 padding，所以拼 False
+        # Append False because the measured-state token is valid.
         state_valid = torch.zeros(vlm_hidden.shape[0], 1, dtype=torch.bool, device=vlm_hidden.device)
         vlm_pad_mask = torch.cat([state_valid, vlm_pad_mask], dim=1)  # [B, 1+L]
 
@@ -466,14 +430,10 @@ class MagVLAPolicy(nn.Module):
         action_delta_gt: Optional[torch.Tensor] = None,
         state_history: Optional[torch.Tensor] = None,
     ) -> dict:
-        """
-        前向传播（走完整 mask 链路，不绕 DDP）。
-
-        images:     [B, T=4, H, W, 3] uint8，RGB
-        task_texts: [B] str
-        states:     [B, 4] float32，normalized，双臂 UMP 位置
-        phase_gt:   [B] long，训练时用于 phase_loss，推理时为 None
-        state_history: [B, 4, 4] normalized 4 帧历史状态
+        """Map RGB history, task text and normalised arm states to phase logits and a
+        five-step chunk. Each step has four coordinates ordered as left x, left y,
+        right x, right y. For inference, use evaluation mode and omit ground-truth
+        phase and action targets.
         """
         # ── 1. VLM Backbone → (hidden, pad_mask) ───────────────────────
         vlm_hidden, vlm_pad_mask = self._run_vlm(images, task_texts)
@@ -492,14 +452,14 @@ class MagVLAPolicy(nn.Module):
         phase_logits = phase_out["phase_logits"]
         phase_token = phase_out["phase_token"]
 
-        # ── 4. ACT Chunk Head（传入 padding mask）────────────────────────
+        # Supply the memory mask to ACT cross-attention.
         action_chunk = self.act_head(
             vlm_hidden,
             phase_token,
             memory_pad_mask=vlm_pad_mask,
         )
 
-        # ── 5. 损失（训练时）──────────────────────────────────────────────
+        # Compute the supervised objectives when requested.
         if return_loss:
             if phase_gt is not None:
                 phase_loss = F.cross_entropy(phase_logits, phase_gt)
@@ -537,7 +497,9 @@ class MagVLAPolicy(nn.Module):
         action_delta_gt: torch.Tensor,
         state_history: Optional[torch.Tensor] = None,
     ) -> dict:
-        """带完整损失计算的前向传播，数据流与 forward() 一致。"""
+        """Compute both supervised objectives from the supplied phase labels and action
+        chunks. Return the combined loss, its components and the policy outputs.
+        """
         # ── 1. VLM Backbone ──────────────────────────────────────────
         vlm_hidden, vlm_pad_mask = self._run_vlm(images, task_texts)
 
@@ -562,7 +524,7 @@ class MagVLAPolicy(nn.Module):
             memory_pad_mask=vlm_pad_mask,
         )
 
-        # ── 5. 完整损失 ────────────────────────────────────────────────
+        # Combine the action and phase losses.
         phase_loss = F.cross_entropy(phase_logits, phase_gt)
         chunk_loss = F.smooth_l1_loss(action_chunk, action_delta_gt, beta=1.0)
         loss = chunk_loss + config.LAMBDA_PHASE * phase_loss
@@ -578,9 +540,10 @@ class MagVLAPolicy(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 工厂函数
+# Policy and optimiser construction.
 # ─────────────────────────────────────────────────────────────────────────────
 def build_policy(device: str = config.DEVICE) -> MagVLAPolicy:
+    """Construct the configured policy on the requested device."""
     policy = MagVLAPolicy(
         vlm_name=config.VLM_NAME,
         chunk_size=config.CHUNK_SIZE,
@@ -593,7 +556,9 @@ def build_policy(device: str = config.DEVICE) -> MagVLAPolicy:
 
 
 def get_optimizer(policy: MagVLAPolicy, total_steps: int):
-    """分别优化 VLM (LoRA) 和两个 Head"""
+    """Return AdamW with separate learning-rate groups for adapters and task-specific
+    layers, together with the warm-up, plateau and cosine scheduler.
+    """
     lora_params = [p for n, p in policy.vlm.named_parameters() if "lora" in n.lower()]
 
     optimizer = torch.optim.AdamW(
@@ -617,10 +582,13 @@ def get_optimizer(policy: MagVLAPolicy, total_steps: int):
         ]
     )
 
-    # Warmup + Plateau + Cosine decay（不归零）
+    # Warm up, hold the learning rate, then apply cosine decay to a positive floor.
     import math
 
     def lr_lambda(step):
+        """Return the multiplier applied to each parameter group at the given
+        optimisation step.
+        """
         warmup = config.WARMUP_STEPS
         plateau = config.PLATEAU_STEPS
         min_ratio = config.MIN_LR_RATIO

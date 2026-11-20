@@ -12,7 +12,11 @@ class TemporalEnsemble:
         self._last_step = None
 
     def update(self, step, chunk):
-        """Return the weighted four-axis action for step, in the input units."""
+        """Combine predictions for this step in a single episode. Supply a strictly
+        increasing integer step and a finite [5, 4] chunk. Each active chunk
+        contributes its row at the current age, weighted by exp(-0.01 * age). Return
+        four actuator increments in the input units.
+        """
         if not isinstance(step, (int, np.integer)) or step < 0:
             raise ValueError("step must be a non-negative integer")
         if self._last_step is not None and step <= self._last_step:

@@ -297,7 +297,7 @@ def train(
                 "lambda_phase": config.LAMBDA_PHASE,
                 "train_samples": len(train_ds),
                 "val_samples": len(val_ds),
-                "loss_type": "huber_smooth_l1",
+                "loss_type": "velocity_prediction_mse",
                 "ddp": True,
                 "world_size": world_size,
             },

@@ -94,7 +94,7 @@ class PhaseHead(nn.Module):
         phase_logits = self.classifier(combined)
 
         # ── 5. Teacher forcing（训练）/ Argmax（推理）──────────────
-        if phase_gt is not None:
+        if self.training and phase_gt is not None:
             phase_ids = phase_gt
         else:
             phase_ids = phase_logits.argmax(dim=-1)

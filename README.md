@@ -1,12 +1,28 @@
-# MagVLA | Magnetic microrobot policy training and CAD
+# Mag-VLA | Bimanual magnetic microrobot manipulation
 
-MARSS contains five implementations of a vision–language–action policy for magnetic microrobot manipulation. Given recent camera frames, measured state and a language instruction, the baseline predicts the current manipulation phase and a short sequence of action increments. The accompanying CAD files describe the robot and maze used as physical design assets. Training consumes recorded demonstrations and does not load either CAD part.
+Mag-VLA predicts coordinated planar movements of two magnet-mounted arms from microscope video, a language instruction and the arms’ measured positions. The external magnets steer the microrobot as it approaches cargo and transports it through a vascular phantom. Start with [the main ACT implementation](MARSS/codebase/policy.py).
+
+**Paper.** Yongchen Wang and Kangyi Lu (equal contribution), Lan Wei, and Dandan Zhang. *Mag-VLA: Vision-Language-Action Model for Bimanual Magnetically Actuated Microrobot Manipulation* (2026). [IEEE publication](https://ieeexplore.ieee.org/document/11655691) · [Open full text](https://arxiv.org/html/2605.28486v1)
+
+## From the paper to the code
+
+| Paper reference | Implementation and scope |
+| --- | --- |
+| Figure 2 and Section III-B | `MagVLAPolicy._run_vlm` encodes four images and the instruction. `_inject_state` appends a token for the two arms’ planar positions in the order left x, left y, right x, right y. |
+| Section III-C.1 and Eq. (1) | `PhaseHead` combines pooled features with current arm positions and the displacement between the oldest and newest states. `ACTChunkHead` uses a learned phase embedding and five action queries to predict five successive four-axis increments. The code uses labelled phases during training and predicted phases in evaluation mode. |
+| Section III-C.2 and Eq. (2) | The paper combines overlapping predicted chunks during deployment. The [offline reference implementation](MARSS/codebase/temporal_ensemble.py) accepts one predicted chunk per replan. It implements the equation independently of the hardware controller. |
+| Section III-D and Eq. (4) | The ACT training objective combines smooth L1 action loss (beta 1) with phase cross-entropy. The released configuration sets the phase weight to 0.5. |
+| Table I and Figure 4 | The paper compares four backbones with a common MLP action head. The release covers the Qwen2.5-VL-7B action-head experiments. It lacks the four-backbone MLP comparison. |
+| Table II and Figure 5 | The three corresponding directories are `MARSS` (ACT), `MARSS-diffusion` and `MARSS-flow`. The paper reports test RMSE of 79.56, 153.52 and 140.50 actuator ticks respectively. Training logs report validation objectives in different units. |
+| Section IV-E | Physical trials assess approach and cargo transport across tasks A–C. Robot rollouts require the external control system. The CAD files describe physical parts and are independent of policy training. |
+
+The paper reports 75 demonstrations with 20,724 frames at 10 Hz and a 60/9/6 episode split. For comparisons with Table II, use held-out test episodes, sample predictions without action or phase targets, and undo action normalisation before computing RMSE. Endpoint error uses the four-axis action at the fifth step. The release does not include the demonstrations, exact split files, trained weights or the original test-scoring script. The two additional folders, `MARSS-label` and `MARSS-test`, are exploratory extensions outside the reported action-head comparison.
 
 ## Choose an experiment
 
 | Directory | What changes | What the comparison can tell you |
 | --- | --- | --- |
-| [MARSS](MARSS/codebase) | The baseline adapts Qwen2.5-VL-7B-Instruct with LoRA. A phase head classifies approach or transport. An ACT-style head regresses five action increments using smooth L1 loss. | Establishes a direct action-regression reference. |
+| [MARSS](MARSS/codebase) | The paper’s main model adapts Qwen2.5-VL-7B-Instruct with LoRA. A phase head classifies approach or transport. An ACT-style head regresses five action increments using smooth L1 loss. | Establishes a reference for Table II. |
 | [MARSS-diffusion](MARSS-diffusion/codebase) | The action head learns to predict noise added to a demonstrated chunk. DDIM sampling generates a chunk at inference. | Tests iterative denoising as an alternative action generator. |
 | [MARSS-flow](MARSS-flow/codebase) | The action head learns a conditional velocity field between Gaussian noise and demonstrated actions. Euler integration generates a chunk at inference. | Tests a continuous-time action generator. |
 | [MARSS-label](MARSS-label/codebase) | Red and green circles mark the object and target on camera frames before resizing. Coordinates and radius come from per-episode annotations. | Tests the effect of supplying explicit visual location cues. |
@@ -34,7 +50,7 @@ Supply a dataset separately. The loaders expect the following paths relative to 
 | `videos/chunk-000/observation.images.main/episode_000000.mp4` | Main-camera video aligned to the rows of the matching episode. |
 | `annotations_point.csv` | For the marked-image experiment, supply `video_name`, `object_x`, `object_y`, `target_x`, `target_y` and `circle_radius`. Check annotation coverage because the loader can continue without marks. |
 
-## Run the baseline
+## Run the main ACT model
 
 Use Python 3.10 or later and a CUDA-enabled PyTorch installation with NCCL and support for bfloat16. Install compatible PyTorch and torchvision builds for your GPU system first. The model weights must be accessible through Hugging Face or a local cache. The text-conditioning experiment also loads `distilbert-base-uncased`.
 
